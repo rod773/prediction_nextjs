@@ -1,5 +1,5 @@
 import "server-only";
-import yahooFinance from "yahoo-finance2";
+import YahooFinance from "yahoo-finance2";
 import * as tf from "@tensorflow/tfjs";
 import { RSI, MACD, ATR, BollingerBands, EMA } from "technicalindicators";
 import { subDays, startOfDay, isSameDay, getHours } from "date-fns";
@@ -103,6 +103,8 @@ class MinMaxScaler {
 
 // --- Main Logic ---
 
+const yahooFinance = new YahooFinance();
+
 export async function predictSymbol(symbol: string): Promise<PredictionResult> {
   // Set seed equivalent (TFJS requires global handling, usually handled at app start)
   // tf.random.setSeed(42);
@@ -114,10 +116,11 @@ export async function predictSymbol(symbol: string): Promise<PredictionResult> {
   const startDate = subDays(endDate, 60);
 
   // Yahoo Finance fetch
-  const rawData = await yahooFinance.historical(symbol, {
+  const result = await yahooFinance.chart(symbol, {
     period1: startDate,
     interval: "1h", // 1 hour interval
   });
+  const rawData = result.quotes;
 
   if (!rawData || rawData.length === 0) {
     throw new Error(`No data found for symbol '${symbol}'`);

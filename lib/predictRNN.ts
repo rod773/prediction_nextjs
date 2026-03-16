@@ -1,18 +1,19 @@
 import "server-only";
 import YahooFinance from "yahoo-finance2";
-import * as tf from "@tensorflow/tfjs";
+import * as tf from "@tensorflow/tfjs-node";
 import { RSI, MACD, ATR, BollingerBands, EMA } from "technicalindicators";
 import { subDays, startOfDay, isSameDay, getHours } from "date-fns";
+import path from "path";
+import fs from "fs";
 
 // --- Types ---
 export interface PredictionResult {
   symbol: string;
   lastKnownPrice: number;
   predictedEodClose: number;
-  metrics: {
-    mae: number;
-    r2: number;
-  };
+  // Metrics are calculated during offline training, not on each prediction.
+  // You can include them here if you load them from a file.
+  metrics?: { mae: number; r2: number };
 }
 
 interface Candle {
@@ -61,6 +62,18 @@ class StandardScaler {
     this.std = this.std.map((sum) => Math.sqrt(sum / n) || 1); // Avoid div by zero
   }
 
+  toJSON() {
+    return { mean: this.mean, std: this.std };
+  }
+
+  static fromJSON(json: { mean: number[]; std: number[] }): StandardScaler {
+    const scaler = new StandardScaler();
+    if (!json.mean || !json.std) throw new Error("Invalid StandardScaler JSON");
+    scaler.mean = json.mean;
+    scaler.std = json.std;
+    return scaler;
+  }
+
   transform(data: number[][]): number[][] {
     return data.map((row) =>
       row.map((val, i) => (val - this.mean[i]) / this.std[i])
@@ -86,6 +99,18 @@ class MinMaxScaler {
     }
   }
 
+  toJSON() {
+    return { min: this.min, max: this.max };
+  }
+
+  static fromJSON(json: { min: number[]; max: number[] }): MinMaxScaler {
+    const scaler = new MinMaxScaler();
+    if (!json.min || !json.max) throw new Error("Invalid MinMaxScaler JSON");
+    scaler.min = json.min;
+    scaler.max = json.max;
+    return scaler;
+  }
+
   transform(data: number[][]): number[][] {
     return data.map((row) =>
       row.map(
@@ -102,20 +127,49 @@ class MinMaxScaler {
 }
 
 // --- Main Logic ---
+const MODEL_DIR = path.join(process.cwd(), "public", "model");
+const MODEL_PATH = `file://${path.join(MODEL_DIR, "model.json")}`;
+const SCALERS_PATH = path.join(MODEL_DIR, "scalers.json");
+
+// Cache for the loaded model and scalers
+let loadedArtifacts: {
+  model: tf.LayersModel;
+  xScaler: StandardScaler;
+  yScaler: MinMaxScaler;
+  featureNames: string[];
+} | null = null;
+
+async function loadModelAndScalers() {
+  if (loadedArtifacts) return loadedArtifacts;
+
+  if (!fs.existsSync(path.join(MODEL_DIR, "model.json"))) {
+    throw new Error(
+      `Model not found at ${MODEL_DIR}. Please run the training script to generate model files.`
+    );
+  }
+
+  console.log("Loading model and scalers...");
+  const model = await tf.loadLayersModel(MODEL_PATH);
+  const scalersData = JSON.parse(fs.readFileSync(SCALERS_PATH, "utf-8"));
+
+  const xScaler = StandardScaler.fromJSON(scalersData.xScaler);
+  const yScaler = MinMaxScaler.fromJSON(scalersData.yScaler);
+  const featureNames = scalersData.featureNames as string[];
+
+  loadedArtifacts = { model, xScaler, yScaler, featureNames };
+  console.log("Model and scalers loaded successfully.");
+  return loadedArtifacts;
+}
 
 const yahooFinance = new YahooFinance();
 
 export async function predictSymbol(symbol: string): Promise<PredictionResult> {
-  // Set seed equivalent (TFJS requires global handling, usually handled at app start)
-  // tf.random.setSeed(42);
-
   console.log(`Fetching data for ${symbol}...`);
 
   // 1. Data Collection
   const endDate = new Date();
-  const startDate = subDays(endDate, 60);
-
-  // Yahoo Finance fetch
+  // Fetch enough data for feature calculation (EMA 50 is longest) + sequence length
+  const startDate = subDays(endDate, 30); // 30 days should be sufficient
   const result = await yahooFinance.chart(symbol, {
     period1: startDate,
     interval: "1h", // 1 hour interval
@@ -126,10 +180,10 @@ export async function predictSymbol(symbol: string): Promise<PredictionResult> {
     throw new Error(`No data found for symbol '${symbol}'`);
   }
 
-  // Resample to 4H
+  // 2. Feature Engineering
   let df: Candle[] = resampleTo4H(rawData as YahooFinanceData[]);
 
-  // 2. Feature Engineering
+  // --- Start of feature engineering ---
   // Need arrays for technicalindicators lib
   const close = df.map((c) => c.close);
   const high = df.map((c) => c.high);
@@ -199,187 +253,44 @@ export async function predictSymbol(symbol: string): Promise<PredictionResult> {
     }
   }
   df = df.slice(lags); // Drop rows with undefined lags
+  // --- End of feature engineering ---
 
-  // 3. Target Definition & Data Splitting
-  const lastDate = df[df.length - 1].date;
-  const predictionDayDate = startOfDay(lastDate);
-
-  const historicalData = df.filter((c) => c.date < predictionDayDate);
-  const predictionData = df.filter((c) => isSameDay(c.date, predictionDayDate));
-
-  if (predictionData.length === 0) {
+  if (df.length < 10) {
+    // Sequence length is 10
     throw new Error(
-      "No data available for the current day to make a prediction."
+      "Not enough data to make a prediction after feature engineering."
     );
   }
 
-  // Create daily close map for historical data
-  // In Python: historical_df.resample('D')['close'].last()
-  const dailyCloseMap = new Map<number, number>(); // timestamp -> close
+  // 3. Load Model and Scalers
+  const { model, xScaler, yScaler, featureNames } = await loadModelAndScalers();
 
-  // Helper to group by day and find last close
-  const tempGroups = new Map<number, number>(); // day timestamp -> last close seen
-  historicalData.forEach((c) => {
-    const dayTs = startOfDay(c.date).getTime();
-    tempGroups.set(dayTs, c.close); // Since we iterate in order, last set is last close
-  });
-
-  // Assign target
-  // historical_df['target_eod_close']
-  const historicalWithTarget = historicalData
-    .filter((c) => {
-      const dayTs = startOfDay(c.date).getTime();
-      return tempGroups.has(dayTs);
-    })
-    .map((c) => ({
-      ...c,
-      target_eod_close: tempGroups.get(startOfDay(c.date).getTime())!,
-    }));
-
-  if (historicalWithTarget.length === 0) {
-    throw new Error(
-      "Not enough historical data to create a training set after filtering. Try a longer date range."
-    );
-  }
-
-  // 4. Data Preparation for RNN
-  const featuresToExclude = [
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "target_eod_close",
-    "date",
-  ];
-
-  // Extract feature names dynamically
-  const featureNames = Object.keys(historicalWithTarget[0]).filter(
-    (k) => !featuresToExclude.includes(k)
-  );
-
-  const X_raw = historicalWithTarget.map((row) =>
-    featureNames.map((name) => row[name])
-  );
-  const y_raw = historicalWithTarget.map((row) => [row.target_eod_close]);
-
-  // Split train/test (80/20)
-  const trainSize = Math.floor(X_raw.length * 0.8);
-  const X_train_raw = X_raw.slice(0, trainSize);
-  const X_test_raw = X_raw.slice(trainSize);
-  const y_train_raw = y_raw.slice(0, trainSize);
-  const y_test_raw = y_raw.slice(trainSize);
-
-  // Scale
-  const xScaler = new StandardScaler();
-  xScaler.fit(X_train_raw);
-  const X_train_scaled = xScaler.transform(X_train_raw);
-  const X_test_scaled = xScaler.transform(X_test_raw);
-
-  const yScaler = new MinMaxScaler();
-  yScaler.fit(y_train_raw);
-  const y_train_scaled = yScaler.transform(y_train_raw);
-  const y_test_scaled = yScaler.transform(y_test_raw);
-
-  // Sequences
+  // 4. Prepare data for prediction
   const sequenceLength = 10;
-
-  const [X_train, y_train] = createSequences(
-    X_train_scaled,
-    y_train_scaled,
-    sequenceLength
-  );
-  const [X_test, y_test] = createSequences(
-    X_test_scaled,
-    y_test_scaled,
-    sequenceLength
-  );
-
-  console.log(`X_train shape: [${X_train.shape}]`);
-
-  // 5. Model Training
-  const model = tf.sequential();
-
-  // SimpleRNN layer 1
-  model.add(
-    tf.layers.simpleRNN({
-      units: 50,
-      activation: "relu",
-      returnSequences: true,
-      inputShape: [sequenceLength, featureNames.length],
-    })
-  );
-  model.add(tf.layers.dropout({ rate: 0.2 }));
-
-  // SimpleRNN layer 2
-  model.add(
-    tf.layers.simpleRNN({
-      units: 50,
-      activation: "relu",
-      returnSequences: false,
-    })
-  );
-  model.add(tf.layers.dropout({ rate: 0.2 }));
-
-  // Dense layers
-  model.add(tf.layers.dense({ units: 25, activation: "relu" }));
-  model.add(tf.layers.dense({ units: 1, activation: "linear" }));
-
-  model.compile({ optimizer: "adam", loss: "meanSquaredError" });
-
-  await model.fit(X_train, y_train, {
-    epochs: 50,
-    batchSize: 32,
-    validationData: [X_test, y_test],
-    verbose: 0, // Set to 1 to see logs in server console
-  });
-
-  // 6. Evaluation
-  const yPredTensor = model.predict(X_test) as tf.Tensor;
-  const yPredScaled = (await yPredTensor.array()) as number[][];
-  const yPred = yScaler.inverseTransform(yPredScaled);
-  const yTestInv = yScaler.inverseTransform(
-    y_test_scaled.slice(sequenceLength)
-  ); // Align with sequence slicing
-
-  // Calculate Metrics (Manual implementation for simple MAE/R2)
-  const mae = calculateMAE(yTestInv, yPred);
-  const r2 = calculateR2(yTestInv, yPred);
-
-  console.log(`MAE: ${mae.toFixed(4)}, R2: ${r2.toFixed(4)}`);
-
-  // 7. Predict Today
-  // Need last sequenceLength from the FULL dataset (df)
-  // We need to re-extract features from 'df' (which contains prediction_df data too)
   const fullFeaturesRaw = df.map((row) =>
     featureNames.map((name) => row[name])
   );
   const latestSequenceRaw = fullFeaturesRaw.slice(-sequenceLength);
 
-  // Scale using existing X scaler
+  // Scale using loaded X scaler
   const latestSequenceScaled = xScaler.transform(latestSequenceRaw);
 
   // Create tensor (1, seq_len, features)
   const inputForPrediction = tf.tensor3d([latestSequenceScaled]);
 
+  // 5. Make Prediction
   const todaysPredScaledTensor = model.predict(inputForPrediction) as tf.Tensor;
   const todaysPredScaled = (await todaysPredScaledTensor.array()) as number[][];
   const todaysPred = yScaler.inverseTransform(todaysPredScaled);
 
   // Cleanup tensors
-  X_train.dispose();
-  y_train.dispose();
-  X_test.dispose();
-  y_test.dispose();
   inputForPrediction.dispose();
   todaysPredScaledTensor.dispose();
-  yPredTensor.dispose();
 
   return {
     symbol: symbol,
     lastKnownPrice: df[df.length - 1].close,
     predictedEodClose: todaysPred[0][0],
-    metrics: { mae, r2 },
   };
 }
 
@@ -421,6 +332,7 @@ function resampleTo4H(data: YahooFinanceData[]): Candle[] {
   return resampled;
 }
 
+// This helper function remains unchanged
 function aggregateBucket(rows: YahooFinanceData[], date: Date): Candle {
   return {
     date: date,
@@ -432,6 +344,7 @@ function aggregateBucket(rows: YahooFinanceData[], date: Date): Candle {
   };
 }
 
+// This helper function is now only needed for the training script
 function createSequences(
   X_data: number[][],
   y_data: number[][],
@@ -446,6 +359,7 @@ function createSequences(
   return [tf.tensor3d(X_seq), tf.tensor2d(y_seq)];
 }
 
+// This helper function is now only needed for the training script
 function calculateMAE(yTrue: number[][], yPred: number[][]): number {
   let sum = 0;
   for (let i = 0; i < yTrue.length; i++) {
@@ -454,6 +368,7 @@ function calculateMAE(yTrue: number[][], yPred: number[][]): number {
   return sum / yTrue.length;
 }
 
+// This helper function is now only needed for the training script
 function calculateR2(yTrue: number[][], yPred: number[][]): number {
   const meanTrue = yTrue.reduce((sum, val) => sum + val[0], 0) / yTrue.length;
   let ssTot = 0;
